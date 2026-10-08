@@ -1,10 +1,13 @@
 package main
 
 import (
-	"encoding/base64"
 	"fmt"
 	"io"
+	"mime"
 	"net/http"
+	"os"
+	"path/filepath"
+	"strings"
 
 	"github.com/bootdotdev/learn-file-storage-s3-golang-starter/internal/auth"
 	"github.com/google/uuid"
@@ -46,12 +49,12 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 	}
 	
 	// Parse thumbnail data
-	mediaType := header.Header.Get("Content-Type")
-	imageBytes, err := io.ReadAll(file)
-	if err != nil {
-		respondWithError(w, http.StatusBadRequest, "Unable to read file", err)
+	mediatype, _, err := mime.ParseMediaType(header.Header.Get("Content-Type"))
+	if mediatype != "image/jpeg" && mediatype != "image/png" {
+		respondWithError(w, http.StatusBadRequest, "Invalid mime type", err)
 		return
 	}
+	fileExtension := strings.Split(mediatype, "/")[1]
 
 	// Get the video struct from SQLITE
 	video, err := cfg.db.GetVideo(videoID)
@@ -64,9 +67,22 @@ func (cfg *apiConfig) handlerUploadThumbnail(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
-	// Update thumbnail url
-	b64Str := base64.StdEncoding.EncodeToString(imageBytes)
-	thumbnailURL := fmt.Sprintf("data:%s;base64,%s", mediaType, b64Str)
+	fileName := fmt.Sprintf("%s.%s", videoID, fileExtension)
+	filePath := filepath.Join(cfg.assetsRoot, fileName)
+	newFile, err := os.Create(filePath)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error creating new file on disk", err)
+		return
+	}
+	defer newFile.Close()
+
+	_, err = io.Copy(newFile, file)
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error writing file to disk", err)
+		return
+	}
+
+	thumbnailURL := fmt.Sprintf("http://localhost:%s/assets/%s", cfg.port, fileName)
 	video.ThumbnailURL = &thumbnailURL
 	err = cfg.db.UpdateVideo(video)
 	if err != nil {
