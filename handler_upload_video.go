@@ -1,13 +1,16 @@
 package main
 
 import (
-	"crypto/rand"
+	"bytes"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
 	"mime"
 	"net/http"
 	"os"
+	"os/exec"
+	"path"
 
 	"github.com/aws/aws-sdk-go-v2/aws"
 	"github.com/aws/aws-sdk-go-v2/service/s3"
@@ -72,7 +75,6 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusBadRequest, "Invalid mime type", err)
 		return
 	}
-	// fileExtension := strings.Split(mediatype, "/")[1]
 
 	// Create the temp file
 	tempFile, err := os.CreateTemp("", "tubely-upload.mp4")
@@ -89,7 +91,7 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		respondWithError(w, http.StatusInternalServerError, "Error writing file to disk", err)
 		return
 	}
-	
+
 	// Reset pointer to start of Tempfile for write
 	_, err = tempFile.Seek(0, io.SeekStart)
 	if err != nil {
@@ -97,14 +99,32 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 		return
 	}
 
+	aspectRatio, err := getVideoAspectRatio(tempFile.Name())
+	if err != nil {
+		respondWithError(w, http.StatusInternalServerError, "Error determining aspect ratio", err)
+		return
+	}
+
+	var formatDirectory string
+	switch aspectRatio {
+	case "9:16":
+		formatDirectory = "portrait"
+	case "16:9":
+		formatDirectory = "landscape"
+	default:
+		formatDirectory = "other"
+	}
+
 	// Create video key
 	fileKey := getAssetPath(mediatype)
+	fileKey = path.Join(formatDirectory, fileKey)
+
 	// Upload to S3
 	s3Params := s3.PutObjectInput{
-		Bucket: &cfg.s3Bucket,
-		Key: aws.String(fileKey),
+		Bucket:      &cfg.s3Bucket,
+		Key:         aws.String(fileKey),
 		ContentType: aws.String("video/mp4"),
-		Body: tempFile,
+		Body:        tempFile,
 	}
 	cfg.s3Client.PutObject(r.Context(), &s3Params)
 
@@ -120,11 +140,44 @@ func (cfg *apiConfig) handlerUploadVideo(w http.ResponseWriter, r *http.Request)
 	respondWithJSON(w, http.StatusOK, video)
 }
 
-func makeRandomKey(bytes int) ([]byte, error) {
-	randomBytes := make([]byte, bytes)
-	_, err := rand.Read(randomBytes)
-	if err != nil {
-		return []byte{}, err
+func getVideoAspectRatio(filePath string) (string, error) {
+	type FFProbeOutput struct {
+		Streams []struct {
+			Width              int    `json:"width"`
+			Height             int    `json:"height"`
+			DisplayAspectRatio string `json:"display_aspect_ratio"`
+		} `json:"streams"`
 	}
-	return randomBytes, nil
+	cmd := exec.Command("ffprobe", "-v", "error", "-print_format", "json", "-show_streams", filePath)
+
+	var output bytes.Buffer
+	cmd.Stdout = &output
+
+	if err := cmd.Run(); err != nil {
+		return "", fmt.Errorf("ffprobe error: %v", err)
+	}
+
+	var probe FFProbeOutput
+	if err := json.Unmarshal(output.Bytes(), &probe); err != nil {
+		return "", fmt.Errorf("could not parse ffprobe output: %v", err)
+	}
+
+	if len(probe.Streams) == 0 {
+		return "", errors.New("no video streams found")
+	}
+
+	aspectRatio := probe.Streams[0].DisplayAspectRatio
+	if aspectRatio != "9:16" && aspectRatio != "16:9" {
+		aspectRatio = "other"
+	}
+
+	// Math version
+	// if width == 16*height/9 {
+	// 	return "16:9", nil
+	// } else if height == 16*width/9 {
+	// 	return "9:16", nil
+	// }
+	// return "other", nil
+
+	return aspectRatio, nil
 }
